@@ -57,6 +57,31 @@
 #define THREAD_ACCESS \
     (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT)
 
+// Suspended threads for Freeze()/Unfreeze().
+typedef struct _FROZEN_THREADS
+{
+    LPHANDLE pItems;         // Data heap
+    UINT     capacity;       // Size of allocated data heap, items
+    UINT     size;           // Actual number of data items
+} FROZEN_THREADS, *PFROZEN_THREADS;
+
+// Thread freeze related definitions.
+typedef NTSTATUS(NTAPI* NtGetNextThread_t)(
+    _In_ HANDLE ProcessHandle,
+    _In_opt_ HANDLE ThreadHandle,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_ ULONG HandleAttributes,
+    _In_ ULONG Flags,
+    _Out_ PHANDLE NewThreadHandle
+    );
+
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
+#endif
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+#endif
 // Hook information.
 typedef struct _HOOK_ENTRY
 {
@@ -74,14 +99,6 @@ typedef struct _HOOK_ENTRY
     UINT8  newIPs[8];           // Instruction boundaries of the trampoline function.
 } HOOK_ENTRY, *PHOOK_ENTRY;
 
-// Suspended threads for Freeze()/Unfreeze().
-typedef struct _FROZEN_THREADS
-{
-    LPDWORD pItems;         // Data heap
-    UINT    capacity;       // Size of allocated data heap, items
-    UINT    size;           // Actual number of data items
-} FROZEN_THREADS, *PFROZEN_THREADS;
-
 //-------------------------------------------------------------------------
 // Global Variables:
 //-------------------------------------------------------------------------
@@ -91,6 +108,11 @@ volatile LONG g_isLocked = FALSE;
 
 // Private heap handle. If not NULL, this library is initialized.
 HANDLE g_hHeap = NULL;
+
+// Thread freeze related variables.
+MH_THREAD_FREEZE_METHOD g_threadFreezeMethod = MH_FREEZE_METHOD_ORIGINAL;
+
+NtGetNextThread_t NtGetNextThread;
 
 // Hook entries.
 struct
@@ -260,7 +282,7 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
 }
 
 //-------------------------------------------------------------------------
-static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
+static BOOL EnumerateAndSuspendThreads(PFROZEN_THREADS pThreads)
 {
     BOOL succeeded = FALSE;
 
@@ -278,31 +300,44 @@ static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
                     && te.th32OwnerProcessID == GetCurrentProcessId()
                     && te.th32ThreadID != GetCurrentThreadId())
                 {
-                    if (pThreads->pItems == NULL)
+                    HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, te.th32ThreadID);
+
+                    if (hThread != NULL && SuspendThread(hThread) == (DWORD)-1)
                     {
-                        pThreads->capacity = INITIAL_THREAD_CAPACITY;
-                        pThreads->pItems
-                            = (LPDWORD)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
+                        CloseHandle(hThread);
+                        hThread = NULL;
+                    }
+
+                    if (hThread != NULL)
+                    {
                         if (pThreads->pItems == NULL)
                         {
-                            succeeded = FALSE;
-                            break;
+                            pThreads->capacity = INITIAL_THREAD_CAPACITY;
+                            pThreads->pItems
+                                = (LPHANDLE)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(HANDLE));
+                            if (pThreads->pItems == NULL)
+                                succeeded = FALSE;
                         }
-                    }
-                    else if (pThreads->size >= pThreads->capacity)
-                    {
-                        pThreads->capacity *= 2;
-                        LPDWORD p = (LPDWORD)HeapReAlloc(
-                            g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(DWORD));
-                        if (p == NULL)
+                        else if (pThreads->size >= pThreads->capacity)
                         {
-                            succeeded = FALSE;
+                            pThreads->capacity *= 2;
+                            LPHANDLE p = (LPHANDLE)HeapReAlloc(
+                                g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(HANDLE));
+                            if (p)
+                                pThreads->pItems = p;
+                            else
+                                succeeded = FALSE;
+                        }
+
+                        if (!succeeded)
+                        {
+                            ResumeThread(hThread);
+                            CloseHandle(hThread);
                             break;
                         }
 
-                        pThreads->pItems = p;
+                        pThreads->pItems[pThreads->size++] = hThread;
                     }
-                    pThreads->pItems[pThreads->size++] = te.th32ThreadID;
                 }
 
                 te.dwSize = sizeof(THREADENTRY32);
@@ -313,6 +348,13 @@ static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
 
             if (!succeeded && pThreads->pItems != NULL)
             {
+                UINT i;
+                for (i = 0; i < pThreads->size; ++i)
+                {
+                    ResumeThread(pThreads->pItems[i]);
+                    CloseHandle(pThreads->pItems[i]);
+                }
+
                 HeapFree(g_hHeap, 0, pThreads->pItems);
                 pThreads->pItems = NULL;
             }
@@ -324,30 +366,125 @@ static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
 }
 
 //-------------------------------------------------------------------------
-static MH_STATUS Freeze(PFROZEN_THREADS pThreads, UINT pos, UINT action)
+static BOOL EnumerateAndSuspendThreadsFast(PFROZEN_THREADS pThreads)
 {
-    MH_STATUS status = MH_OK;
+    BOOL succeeded = TRUE;
 
-    pThreads->pItems   = NULL;
-    pThreads->capacity = 0;
-    pThreads->size     = 0;
-    if (!EnumerateThreads(pThreads))
+    HANDLE hThread = NULL;
+    BOOL bClosePrevThread = FALSE;
+    while (1)
     {
-        status = MH_ERROR_MEMORY_ALLOC;
+        HANDLE hNextThread;
+        NTSTATUS status = NtGetNextThread(GetCurrentProcess(), hThread, THREAD_ACCESS, 0, 0, &hNextThread);
+        if (bClosePrevThread)
+            CloseHandle(hThread);
+
+        if (!NT_SUCCESS(status))
+        {
+            if (status != STATUS_NO_MORE_ENTRIES)
+                succeeded = FALSE;
+            break;
+        }
+
+        hThread = hNextThread;
+        bClosePrevThread = TRUE;
+
+        if (GetThreadId(hThread) == GetCurrentThreadId())
+            continue;
+
+        if (SuspendThread(hThread) == (DWORD)-1)
+            continue;
+
+        bClosePrevThread = FALSE;
+
+        if (pThreads->pItems == NULL)
+        {
+            pThreads->capacity = INITIAL_THREAD_CAPACITY;
+            pThreads->pItems
+                = (LPHANDLE)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(HANDLE));
+            if (pThreads->pItems == NULL)
+                succeeded = FALSE;
+        }
+        else if (pThreads->size >= pThreads->capacity)
+        {
+            pThreads->capacity *= 2;
+            LPHANDLE p = (LPHANDLE)HeapReAlloc(
+                g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(HANDLE));
+            if (p)
+                pThreads->pItems = p;
+            else
+                succeeded = FALSE;
+        }
+
+        if (!succeeded)
+        {
+            ResumeThread(hThread);
+            CloseHandle(hThread);
+            break;
+        }
+
+        // Perform a synchronous operation to make sure the thread really is suspended.
+        // https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743
+        CONTEXT c;
+        c.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(hThread, &c);
+
+        pThreads->pItems[pThreads->size++] = hThread;
     }
-    else if (pThreads->pItems != NULL)
+
+    if (!succeeded && pThreads->pItems != NULL)
     {
         UINT i;
         for (i = 0; i < pThreads->size; ++i)
         {
-            HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, pThreads->pItems[i]);
-            if (hThread != NULL)
-            {
-                SuspendThread(hThread);
-                ProcessThreadIPs(hThread, pos, action);
-                CloseHandle(hThread);
-            }
+            ResumeThread(pThreads->pItems[i]);
+            CloseHandle(pThreads->pItems[i]);
         }
+
+        HeapFree(g_hHeap, 0, pThreads->pItems);
+        pThreads->pItems = NULL;
+    }
+
+    return succeeded;
+}
+
+//-------------------------------------------------------------------------
+static VOID ProcessFrozenThreads(PFROZEN_THREADS pThreads, UINT pos, BOOL enable)
+{
+    if (pThreads->pItems != NULL)
+    {
+        UINT i;
+        for (i = 0; i < pThreads->size; ++i)
+        {
+            ProcessThreadIPs(pThreads->pItems[i], pos, enable);
+        }
+    }
+}
+
+//-------------------------------------------------------------------------
+static MH_STATUS Freeze(PFROZEN_THREADS pThreads)
+{
+    MH_STATUS status = MH_OK;
+
+    pThreads->pItems = NULL;
+    pThreads->capacity = 0;
+    pThreads->size = 0;
+
+    switch (g_threadFreezeMethod)
+    {
+    case MH_FREEZE_METHOD_ORIGINAL:
+        if (!EnumerateAndSuspendThreads(pThreads))
+            status = MH_ERROR_MEMORY_ALLOC;
+        break;
+
+    case MH_FREEZE_METHOD_FAST_UNDOCUMENTED:
+        if (!EnumerateAndSuspendThreadsFast(pThreads))
+            status = MH_ERROR_MEMORY_ALLOC;
+        break;
+
+    case MH_FREEZE_METHOD_NONE_UNSAFE:
+        // Nothing to do.
+        break;
     }
 
     return status;
@@ -374,7 +511,7 @@ static VOID Unfreeze(PFROZEN_THREADS pThreads)
 }
 
 //-------------------------------------------------------------------------
-static MH_STATUS EnableHookLL(UINT pos, BOOL enable)
+static MH_STATUS EnableHookLL(UINT pos, BOOL enable, PFROZEN_THREADS pThreads)
 {
     PHOOK_ENTRY pHook = &g_hooks.pItems[pos];
     DWORD  oldProtect;
@@ -416,6 +553,8 @@ static MH_STATUS EnableHookLL(UINT pos, BOOL enable)
     // Just-in-case measure.
     FlushInstructionCache(GetCurrentProcess(), pPatchTarget, patchSize);
 
+    ProcessFrozenThreads(pThreads, pos, enable);
+
     pHook->isEnabled   = enable;
     pHook->queueEnable = enable;
 
@@ -447,7 +586,7 @@ static MH_STATUS EnableAllHooksLL(BOOL enable)
             {
                 if (g_hooks.pItems[i].isEnabled != enable)
                 {
-                    status = EnableHookLL(i, enable);
+                    status = EnableHookLL(i, enable, &threads);
                     if (status != MH_OK)
                         break;
                 }
@@ -560,7 +699,37 @@ MH_STATUS WINAPI MH_Uninitialize(VOID)
 }
 
 //-------------------------------------------------------------------------
-MH_STATUS WINAPI MH_CreateHook(LPVOID pTarget, LPVOID pDetour, LPVOID *ppOriginal)
+MH_STATUS WINAPI MH_SetThreadFreezeMethod(MH_THREAD_FREEZE_METHOD method)
+{
+    EnterSpinLock();
+    if (g_hHeap == NULL)
+    {
+        LeaveSpinLock();
+        return MH_ERROR_NOT_INITIALIZED;
+    }
+
+    if (method == MH_FREEZE_METHOD_FAST_UNDOCUMENTED && !NtGetNextThread)
+    {
+        HMODULE hNtdll = GetModuleHandle(L"ntdll.dll");
+        if (hNtdll)
+            NtGetNextThread = (NtGetNextThread_t)GetProcAddress(hNtdll, "NtGetNextThread");
+
+        if (!NtGetNextThread)
+        {
+            // Fall back to the original method.
+            method = MH_FREEZE_METHOD_ORIGINAL;
+        }
+    }
+
+    g_threadFreezeMethod = method;
+
+    LeaveSpinLock();
+
+    return MH_OK;
+}
+
+//-------------------------------------------------------------------------
+MH_STATUS WINAPI MH_CreateHook(LPVOID pTarget, LPVOID pDetour, LPVOID* ppOriginal)
 {
     MH_STATUS status = MH_OK;
 
@@ -675,7 +844,7 @@ MH_STATUS WINAPI MH_RemoveHook(LPVOID pTarget)
                 status = Freeze(&threads, pos, ACTION_DISABLE);
                 if (status == MH_OK)
                 {
-                    status = EnableHookLL(pos, FALSE);
+                    status = EnableHookLL(pos, FALSE, &threads);
 
                     Unfreeze(&threads);
                 }
@@ -726,7 +895,7 @@ static MH_STATUS EnableHook(LPVOID pTarget, BOOL enable)
                     status = Freeze(&threads, pos, ACTION_ENABLE);
                     if (status == MH_OK)
                     {
-                        status = EnableHookLL(pos, enable);
+                        status = EnableHookLL(pos, enable, &threads);
 
                         Unfreeze(&threads);
                     }
@@ -844,7 +1013,7 @@ MH_STATUS WINAPI MH_ApplyQueued(VOID)
                     PHOOK_ENTRY pHook = &g_hooks.pItems[i];
                     if (pHook->isEnabled != pHook->queueEnable)
                     {
-                        status = EnableHookLL(i, pHook->queueEnable);
+                        status = EnableHookLL(i, pHook->queueEnable, &threads);
                         if (status != MH_OK)
                             break;
                     }

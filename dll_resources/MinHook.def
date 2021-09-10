@@ -1,6 +1,7 @@
 EXPORTS
     MH_Initialize
     MH_Uninitialize
+    MH_SetThreadFreezeMethod
 
     MH_CreateHook
     MH_CreateHookApi
