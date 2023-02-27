@@ -498,12 +498,8 @@ static VOID Unfreeze(PFROZEN_THREADS pThreads)
         UINT i;
         for (i = 0; i < pThreads->size; ++i)
         {
-            HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, pThreads->pItems[i]);
-            if (hThread != NULL)
-            {
-                ResumeThread(hThread);
-                CloseHandle(hThread);
-            }
+            ResumeThread(pThreads->pItems[i]);
+            CloseHandle(pThreads->pItems[i]);
         }
 
         HeapFree(g_hHeap, 0, pThreads->pItems);
@@ -548,12 +544,14 @@ static MH_STATUS EnableHookLL(UINT pos, BOOL enable, PFROZEN_THREADS pThreads)
             memcpy(pPatchTarget, pHook->backup, sizeof(JMP_REL));
     }
 
-    VirtualProtect(pPatchTarget, patchSize, oldProtect, &oldProtect);
+    if (!VirtualProtect(pPatchTarget, patchSize, oldProtect, &oldProtect))
+        return MH_ERROR_MEMORY_PROTECT;
 
     // Just-in-case measure.
     FlushInstructionCache(GetCurrentProcess(), pPatchTarget, patchSize);
 
-    ProcessFrozenThreads(pThreads, pos, enable);
+    if (g_threadFreezeMethod != MH_FREEZE_METHOD_NONE_UNSAFE)
+        ProcessFrozenThreads(pThreads, pos, enable);
 
     pHook->isEnabled   = enable;
     pHook->queueEnable = enable;
@@ -579,7 +577,7 @@ static MH_STATUS EnableAllHooksLL(BOOL enable)
     if (first != INVALID_HOOK_POS)
     {
         FROZEN_THREADS threads;
-        status = Freeze(&threads, ALL_HOOKS_POS, enable ? ACTION_ENABLE : ACTION_DISABLE);
+        status = Freeze(&threads);
         if (status == MH_OK)
         {
             for (i = first; i < g_hooks.size; ++i)
